@@ -31,6 +31,30 @@ from pyscf import lib
 from pyscf.lib.diis import DIIS
 from pyscf.lib import logger
 
+try:
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+except ImportError:
+    rank = 0
+    size = 1
+    comm = None
+
+def get_kpts_indices(nkpts, rank=None):
+    """
+    Returns the indices of k-points assigned to the specified rank (default: current rank).
+    """
+    if rank is None:
+        from pyscf.pbc.pwscf.pw_helper import rank
+        
+    if size == 1:
+        return list(range(nkpts))
+    
+    k_indices = [k for k in range(nkpts) if k % size == rank]
+    return k_indices
+
+
 
 class PWBasis:
     """

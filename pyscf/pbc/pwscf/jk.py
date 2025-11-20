@@ -25,6 +25,7 @@ import numpy as np
 from pyscf.pbc import tools
 from pyscf.pbc.pwscf.pw_helper import (get_kcomp, set_kcomp, acc_kcomp,
                                        scale_kcomp, wf_fft, wf_ifft)
+from pyscf.pbc.pwscf import pw_helper
 from pyscf.pbc.lib.kpts_helper import member, is_zero
 from pyscf import lib
 from pyscf import __config__
@@ -46,15 +47,27 @@ def get_rho_R(C_ks, mocc_ks, mesh, basis_ks=None):
     """
     Normalization is (1.0 / nkpts) * ng * rho_R.sum() = nelec
     """
-    nkpts = len(C_ks)
+    nkpts = len(mocc_ks) # mocc_ks is replicated, so len is total nkpts
+    
+    # KPAR: Compute partial density
+    my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
+    
     rho_R = 0.
-    for k in range(nkpts):
+    for i, k in enumerate(my_kpts_idx):
         occ = np.where(mocc_ks[k] > THR_OCC)[0].tolist()
-        Co_k = get_kcomp(C_ks, k, occ=occ)
+        # C_ks is distributed, so C_ks[i] corresponds to kpts[k]
+        Co_k = get_kcomp(C_ks, i, occ=occ)
+        # print(f"Rank {pw_helper.rank} k={k} Co_k norm: {np.linalg.norm(Co_k)}")
         basis = None if basis_ks is None else basis_ks[k]
         Co_k_R = wf_ifft(Co_k, mesh, basis)
+        # print(f"Rank {pw_helper.rank} k={k} Co_k_R norm: {np.linalg.norm(Co_k_R)}")
         _mul_by_occ_(Co_k_R, mocc_ks[k], occ)
         rho_R += np.einsum("ig,ig->g", Co_k_R.conj(), Co_k_R).real
+        
+    # KPAR: Allreduce to get global density
+    if pw_helper.size > 1:
+        rho_R = pw_helper.comm.allreduce(rho_R, op=pw_helper.MPI.SUM)
+        
     return rho_R
 
 
@@ -86,24 +99,79 @@ def apply_k_kpt(cell, C_k, kpt1, C_ks, mocc_ks, kpts, mesh, Gv,
     Cbar_k = np.zeros_like(C_k)
     if C_k_R is None: C_k_R = wf_ifft(C_k, mesh, basis=basis)
 
-    for k2 in range(nkpts):
-        kpt2 = kpts[k2]
-        coulG = tools.get_coulG(cell, kpt1-kpt2, exx=False, mesh=mesh, Gv=Gv)
+    # KPAR: Ring Algorithm for Exact Exchange
+    
+    # Helper to compute interaction with a batch of k-points
+    def compute_exx_batch(C_ks_batch, kpts_indices_batch):
+        Cbar_batch = np.zeros_like(Cbar_k)
+        for i, k2 in enumerate(kpts_indices_batch):
+            kpt2 = kpts[k2]
+            coulG = tools.get_coulG(cell, kpt1-kpt2, exx=False, mesh=mesh, Gv=Gv)
 
-        occ = np.where(mocc_ks[k2]>THR_OCC)[0]
-        no_k2 = occ.size
-        if C_ks_R is None:
-            Co_k2 = get_kcomp(C_ks, k2, occ=occ)
+            occ = np.where(mocc_ks[k2]>THR_OCC)[0]
+            no_k2 = occ.size
+            
+            # C_ks_batch is a list of arrays
+            Co_k2 = get_kcomp(C_ks_batch, i, occ=occ)
             Co_k2_R = wf_ifft(Co_k2, mesh, basis=basis_ks[k2])
             Co_k2 = None
-        else:
-            Co_k2_R = get_kcomp(C_ks_R, k2, occ=occ)
-        _mul_by_occ_(Co_k2_R, mocc_ks[k2], occ)
-        for j in range(no_k2):
-            Cj_k2_R = Co_k2_R[j]
-            vij_R = tools.ifft(
-                tools.fft(C_k_R * Cj_k2_R.conj(), mesh) * coulG, mesh)
-            Cbar_k += vij_R * Cj_k2_R
+            
+            _mul_by_occ_(Co_k2_R, mocc_ks[k2], occ)
+            for j in range(no_k2):
+                Cj_k2_R = Co_k2_R[j]
+                vij_R = tools.ifft(
+                    tools.fft(C_k_R * Cj_k2_R.conj(), mesh) * coulG, mesh)
+                Cbar_batch += vij_R * Cj_k2_R
+        return Cbar_batch
+
+    if pw_helper.size == 1:
+        # Serial case
+        Cbar_k = compute_exx_batch(C_ks, range(nkpts))
+    else:
+        # MPI Ring Algorithm
+        comm = pw_helper.comm
+        rank = pw_helper.rank
+        size = pw_helper.size
+        
+        # My local data
+        my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
+        my_C_ks = C_ks # This is already the local slice
+        
+        # 1. Compute interaction with my own k-points
+        Cbar_k += compute_exx_batch(my_C_ks, my_kpts_idx)
+        
+        # 2. Ring communication
+        # We need to pass both C_ks and the corresponding k-point indices
+        # But k-point indices are deterministic based on rank, so we just need to track the source rank.
+        
+        send_C_ks = my_C_ks
+        recv_C_ks = None
+        
+        src = (rank - 1) % size
+        dst = (rank + 1) % size
+        
+        for step in range(1, size):
+            # Send to next, receive from prev
+            # We use sendrecv to avoid deadlock
+            # Note: C_ks can be large, so this might be slow. 
+            # Ideally we should use Isend/Irecv with computation overlap, but let's start simple.
+            
+            recv_C_ks = comm.sendrecv(sendobj=send_C_ks, dest=dst, source=src)
+            
+            # Determine which k-points we received
+            # The received batch comes from rank (rank - step) % size
+            sender_rank = (rank - step) % size
+            sender_kpts_idx = pw_helper.get_kpts_indices(nkpts) # This function uses global rank/size, we need to mock it or pass args
+            
+            # Re-implement logic for sender rank
+            # k_indices = [k for k in range(nkpts) if k % size == sender_rank]
+            sender_kpts_idx = [k for k in range(nkpts) if k % size == sender_rank]
+            
+            # Compute interaction
+            Cbar_k += compute_exx_batch(recv_C_ks, sender_kpts_idx)
+            
+            # Prepare for next step
+            send_C_ks = recv_C_ks
 
     Cbar_k = wf_fft(Cbar_k, mesh, basis=basis) * fac
 

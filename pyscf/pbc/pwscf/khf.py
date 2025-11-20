@@ -94,6 +94,13 @@ def kernel_doubleloop(mf, C0=None,
     else:
         fswap = None
         C_ks = None
+    
+    # KPAR: Distribute k-points
+    nkpts = len(mf.kpts)
+    my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
+    
+    # C_ks will be a list of length len(my_kpts_idx)
+    # mocc_ks will be a list of length nkpts (replicated)
     C_ks, mocc_ks = mf.get_init_guess(nvir=nbandv_tot, C0=C0, out=C_ks)
 
     tock = np.asarray([logger.process_clock(), logger.perf_counter()])
@@ -412,13 +419,19 @@ def remove_extra_virbands(C_ks, moe_ks, mocc_ks, nbandv_extra):
     if isinstance(moe_ks[0], np.ndarray):
         if nbandv_extra > 0:
             nkpts = len(moe_ks)
+            my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
             for k in range(nkpts):
                 n_k = len(moe_ks[k])
                 occ = list(range(n_k-nbandv_extra))
                 moe_ks[k] = moe_ks[k][occ]
                 mocc_ks[k] = mocc_ks[k][occ]
-                C = get_kcomp(C_ks, k, occ=occ)
-                set_kcomp(C, C_ks, k)
+                
+                # KPAR: Only update C_ks if I own k
+                if k in my_kpts_idx:
+                    # We need to find the local index i such that my_kpts_idx[i] == k
+                    i = my_kpts_idx.index(k)
+                    C = get_kcomp(C_ks, i, occ=occ)
+                    set_kcomp(C, C_ks, i)
     else:
         ncomp = len(moe_ks)
         if isinstance(nbandv_extra, int):
@@ -693,11 +706,16 @@ def orth_mo1(cell, C, mocc, thr_nonorth=1e-6, thr_lindep=1e-8, follow=True):
 
 
 def orth_mo(cell, C_ks, mocc_ks, thr=1e-3):
+    # KPAR: C_ks is distributed, mocc_ks is replicated
+    # We need to iterate over the local k-points
     nkpts = len(mocc_ks)
-    for k in range(nkpts):
-        C_k = get_kcomp(C_ks, k)
+    my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
+    
+    for i, k in enumerate(my_kpts_idx):
+        # C_ks[i] corresponds to kpts[k]
+        C_k = get_kcomp(C_ks, i)
         C_k = orth_mo1(cell, C_k, mocc_ks[k], thr)
-        set_kcomp(C_k, C_ks, k)
+        set_kcomp(C_k, C_ks, i)
         C_k = None
 
     return C_ks
@@ -794,8 +812,26 @@ def get_init_guess(cell0, kpts, basis=None, pseudo=None, nvir=0,
     ntot_ks = [min(ntot,nmo_ks[k]) for k in range(nkpts)]
 
     log.debug1("converting init MOs from GTO basis to PW basis")
-    C_ks = pw_helper.get_C_ks_G(cell, kpts, mo_coeff, ntot_ks, out=out,
+    
+    # KPAR: Only compute C_ks for my k-points
+    my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
+    my_kpts = kpts[my_kpts_idx]
+    my_ntot_ks = [ntot_ks[k] for k in my_kpts_idx]
+    
+    # We need to slice mo_coeff to get only my k-points
+    if isinstance(mo_coeff, list):
+        my_mo_coeff = [mo_coeff[k] for k in my_kpts_idx]
+    else:
+        # If mo_coeff is a single array (e.g. Gamma point only or not k-point dependent), 
+        # this might need adjustment, but usually for KRHF it is a list.
+        # If it's a single array but nkpts > 1, it implies k-independent MOs? 
+        # Standard KRHF returns a list.
+        my_mo_coeff = [mo_coeff[k] for k in my_kpts_idx]
+
+    C_ks = pw_helper.get_C_ks_G(cell, my_kpts, my_mo_coeff, my_ntot_ks, out=out,
                                 verbose=cell0.verbose, mesh=mesh)
+    
+    # mocc_ks is small, so we keep it replicated on all ranks
     mocc_ks = [mo_occ[k][:ntot_ks[k]] for k in range(nkpts)]
 
     C_ks = orth_mo(cell0, C_ks, mocc_ks)
@@ -808,25 +844,38 @@ def get_init_guess(cell0, kpts, basis=None, pseudo=None, nvir=0,
 def add_random_mo(cell, n_ks, C_ks, mocc_ks):
     """ Add random MOs if C_ks[k].shape[0] < n_ks[k] for any k
     """
-    log = logger.Logger(cell.stdout, cell.verbose)
-
-    nkpts = len(n_ks)
-    for k in range(nkpts):
+    # KPAR: C_ks is distributed
+    nkpts = len(mocc_ks)
+    my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
+    
+    for i, k in enumerate(my_kpts_idx):
+        C0 = get_kcomp(C_ks, i)
         n = n_ks[k]
-        C0 = get_kcomp(C_ks, k)
         n0 = C0.shape[0]
+        # print(f"Rank {pw_helper.rank} Kpt {k}: n={n}, n0={n0}")
         if n0 < n:
             n1 = n - n0
-            log.warn("Requesting more orbitals than currently have "
-                     "(%d > %d) for kpt %d. Adding %d random orbitals.",
-                     n, n0, k, n1)
-            C = add_random_mo1(cell, n, C0)
-            set_kcomp(C, C_ks, k)
-            C = None
-
+            # print(f"Rank {pw_helper.rank} Extending Kpt {k} by {n1}")
+            C_k = add_random_mo1(cell, n, C0)
+            set_kcomp(C_k, C_ks, i)
             mocc = mocc_ks[k]
             mocc_ks[k] = np.concatenate([mocc, np.zeros(n1,dtype=mocc.dtype)])
         C0 = None
+        
+    # Synchronize mocc_ks
+    if pw_helper.size > 1:
+        # Each rank has updated its own mocc_ks[k].
+        # We need to gather them.
+        # Since mocc_ks is a list of arrays, we can use allgather on the list of "my" mocc_ks
+        
+        my_mocc_ks = [mocc_ks[k] for k in my_kpts_idx]
+        all_mocc_ks_flat = pw_helper.comm.allgather(my_mocc_ks)
+        
+        # Reconstruct mocc_ks
+        for rank_idx, k_indices in enumerate([pw_helper.get_kpts_indices(nkpts, rank=r) for r in range(pw_helper.size)]):
+             for i, k_idx in enumerate(k_indices):
+                 if rank_idx < len(all_mocc_ks_flat) and i < len(all_mocc_ks_flat[rank_idx]):
+                     mocc_ks[k_idx] = all_mocc_ks_flat[rank_idx][i]
 
     return C_ks, mocc_ks
 
@@ -995,18 +1044,53 @@ def eig_subspace(mf, C_ks, mocc_ks, mesh=None, Gv=None, vj_R=None, exxdiv=None,
 
     kpts = mf.kpts
     nkpts = len(kpts)
-    moe_ks = [None] * nkpts
-    for k in range(nkpts):
+    
+    # KPAR: Diagonalize only my k-points
+    my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
+    my_nkpts = len(my_kpts_idx)
+    
+    # moe_ks needs to be gathered to all ranks
+    my_moe_ks = [None] * my_nkpts
+    
+    for i, k in enumerate(my_kpts_idx):
         kpt = kpts[k]
-        C_k = get_kcomp(C_ks, k)
+        # C_ks is distributed, so C_ks[i] corresponds to kpts[k]
+        C_k = get_kcomp(C_ks, i) 
+        
+        # apply_Fock_kpt needs to handle distributed C_ks/mocc_ks?
+        # Actually apply_Fock_kpt (via apply_veff_kpt) calls apply_k_kpt in jk.py
+        # We need to ensure apply_k_kpt handles distributed C_ks.
+        
         Cbar_k = mf.apply_Fock_kpt(C_k, kpt, mocc_ks, mesh, Gv, vj_R, exxdiv,
                                    comp=comp, ret_E=False)
         F_k = lib.dot(C_k.conj(), Cbar_k.T)
         e, u = scipy.linalg.eigh(F_k)
-        moe_ks[k] = e
+        my_moe_ks[i] = e
         C_k = lib.dot(u.T, C_k)
-        set_kcomp(C_k, C_ks, k)
+        set_kcomp(C_k, C_ks, i)
         C_k = Cbar_k = None
+
+    # Gather moe_ks to all ranks
+    if pw_helper.size > 1:
+        # We need to reconstruct the full list of moe_ks
+        # This is a bit tricky because my_moe_ks is a list of arrays of potentially different sizes
+        # But usually nband is constant.
+        # Let's use MPI gather.
+        
+        # First, make sure we can pickle/gather
+        all_moe_ks_flat = pw_helper.comm.allgather(my_moe_ks)
+        # all_moe_ks_flat is a list of lists: [[moe_k1, moe_k3], [moe_k2, moe_k4]] (if round robin)
+        
+        moe_ks = [None] * nkpts
+        for rank_idx, k_indices in enumerate([pw_helper.get_kpts_indices(nkpts, rank=r) for r in range(pw_helper.size)]):
+             for i, k_idx in enumerate(k_indices):
+                 if rank_idx < len(all_moe_ks_flat) and i < len(all_moe_ks_flat[rank_idx]):
+                     moe_ks[k_idx] = all_moe_ks_flat[rank_idx][i]
+                 else:
+                     # Should not happen if logic is correct
+                     pass
+    else:
+        moe_ks = my_moe_ks
 
     if comp is None:
         mocc_ks = mf.get_mo_occ(moe_ks=moe_ks)
@@ -1238,38 +1322,53 @@ def energy_elec(mf, C_ks, mocc_ks, mesh=None, Gv=None, moe_ks=None,
 
     kpts = mf.kpts
     nkpts = len(kpts)
+    
+    # KPAR: Distributed execution
+    my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
 
     wts = mf.weights
     e_ks = np.zeros(nkpts)
     if moe_ks is None:
         if vj_R is None: vj_R = mf.get_vj_R(C_ks, mocc_ks)
         e_comp = 0  # np.zeros(5)
-        for k in range(nkpts):
+        for i, k in enumerate(my_kpts_idx):
             kpt = kpts[k]
             occ = np.where(mocc_ks[k] > THR_OCC)[0]
-            Co_k = get_kcomp(C_ks, k, occ=occ)
+            C_k = get_kcomp(C_ks, i)
+            Co_k = C_k[occ]
             e_comp_k = mf.apply_Fock_kpt(Co_k, kpt, mocc_ks, mesh, Gv,
                                          vj_R, exxdiv, ret_E=True)[1]
             e_ks[k] = np.sum(e_comp_k)
             e_comp += e_comp_k * wts[k]
+            
+        # Global Sum
+        if pw_helper.size > 1:
+            e_comp = pw_helper.comm.allreduce(e_comp, op=pw_helper.MPI.SUM)
+            e_ks = pw_helper.comm.allreduce(e_ks, op=pw_helper.MPI.SUM)
 
         if exxdiv == "ewald":
             e_comp[mf.scf_summary["e_comp_name_lst"].index("ex")] += \
                                                         mf.etot_shift_ewald
-
+        
         for comp,e in zip(mf.scf_summary["e_comp_name_lst"], e_comp):
             mf.scf_summary[comp] = e
     else:
-        for k in range(nkpts):
+        for i, k in enumerate(my_kpts_idx):
             kpt = kpts[k]
             occ = np.where(mocc_ks[k] > THR_OCC)[0]
-            Co_k = get_kcomp(C_ks, k, occ=occ)
+            C_k = get_kcomp(C_ks, i)
+            Co_k = C_k[occ]
             mocc_k = mocc_ks[k][occ]
             e1_comp = mf.apply_hcore_kpt(Co_k, kpt, mesh, Gv, mf.with_pp,
                                          mocc_ks=mocc_k, ret_E=True)[1]
             e_ks[k] = 0.5 * np.sum(e1_comp)
             e_ks[k] += 0.5 * np.sum(moe_ks[k][occ] * mocc_k)
+            
+        if pw_helper.size > 1:
+            e_ks = pw_helper.comm.allreduce(e_ks, op=pw_helper.MPI.SUM)
+            
     e_scf = np.dot(e_ks, wts)
+
 
     if moe_ks is None and exxdiv == "ewald":
         # Note: ewald correction is not needed if e_tot is computed from
@@ -1360,22 +1459,49 @@ def converge_band(mf, C_ks, mocc_ks, kpts, Cout_ks=None,
 
     nkpts = len(kpts)
     if Cout_ks is None: Cout_ks = C_ks
+    
+    # KPAR: Distributed execution
+    my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
+    my_nkpts = len(my_kpts_idx)
+    
     conv_ks = [None] * nkpts
     moeout_ks = [None] * nkpts
     fc_ks = [None] * nkpts
+    
+    # Local results
+    my_conv_ks = [None] * my_nkpts
+    my_moeout_ks = [None] * my_nkpts
+    my_fc_ks = [None] * my_nkpts
 
-    for k in range(nkpts):
+    for i, k in enumerate(my_kpts_idx):
         kpt = kpts[k]
-        C_k = get_kcomp(C_ks, k)
-        conv_, moeout_ks[k], Cout_k, fc_ks[k] = \
+        C_k = get_kcomp(C_ks, i)
+        conv_, my_moeout_ks[i], Cout_k, my_fc_ks[i] = \
                     mf.converge_band_kpt(C_k, kpt, mocc_ks,
                                          mesh=mesh, Gv=Gv,
                                          vj_R=vj_R, comp=comp,
                                          conv_tol_davidson=conv_tol_davidson,
                                          max_cycle_davidson=max_cycle_davidson,
                                          verbose_davidson=verbose_davidson)
-        set_kcomp(Cout_k, Cout_ks, k)
-        conv_ks[k] = np.prod(conv_)
+        set_kcomp(Cout_k, Cout_ks, i)
+        my_conv_ks[i] = np.prod(conv_)
+
+    # Gather results
+    if pw_helper.size > 1:
+        all_conv = pw_helper.comm.allgather(my_conv_ks)
+        all_moe = pw_helper.comm.allgather(my_moeout_ks)
+        all_fc = pw_helper.comm.allgather(my_fc_ks)
+        
+        for rank_idx, k_indices in enumerate([pw_helper.get_kpts_indices(nkpts, rank=r) for r in range(pw_helper.size)]):
+             for i, k_idx in enumerate(k_indices):
+                 if rank_idx < len(all_conv) and i < len(all_conv[rank_idx]):
+                     conv_ks[k_idx] = all_conv[rank_idx][i]
+                     moeout_ks[k_idx] = all_moe[rank_idx][i]
+                     fc_ks[k_idx] = all_fc[rank_idx][i]
+    else:
+        conv_ks = my_conv_ks
+        moeout_ks = my_moeout_ks
+        fc_ks = my_fc_ks
 
     return conv_ks, moeout_ks, Cout_ks, fc_ks
 
@@ -1985,9 +2111,13 @@ class PWKRHF(PWKSCF):
             raise RuntimeError
 
         if self._basis_data is not None:
-            for k, kpt in enumerate(self.kpts):
+            # KPAR: C_ks is distributed
+            my_kpts_idx = pw_helper.get_kpts_indices(len(self.kpts))
+            for i, k in enumerate(my_kpts_idx):
+                kpt = self.kpts[k]
                 inds = self.get_basis_kpt(kpt).indexes
-                set_kcomp(np.ascontiguousarray(C_ks[k][:, inds]), C_ks, k)
+                C_k = get_kcomp(C_ks, i)
+                set_kcomp(np.ascontiguousarray(C_k[:, inds]), C_ks, i)
 
         return C_ks, mocc_ks
 

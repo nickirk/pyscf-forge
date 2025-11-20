@@ -65,32 +65,53 @@ def get_rho_for_xc(mf, xctype, C_ks, mocc_ks, mesh=None, Gv=None,
         mocc_ks = [mocc_ks]
     outshape = (nspin, nrho, np.prod(mesh))
     rhovec_R = np.ndarray(outshape, buffer=out)
+    
+    from pyscf.pbc.pwscf import pw_helper
+    
     if nrho > 0:
         for s in range(nspin):
             rhovec_R[s, 0] = mf.with_jk.get_rho_R(
                 C_ks[s], mocc_ks[s], mesh=mesh, Gv=Gv
             )
+            
     if nrho > 1:
         for s in range(nspin):
             rho_G = tools.fft(rhovec_R[s, 0], mesh)
             for v in range(3):
                 drho_G = 1j * Gv[:, v] * rho_G
                 rhovec_R[s, v + 1] = tools.ifft(drho_G, mesh).real
+                
     if nrho > 4:
+        nkpts = len(mocc_ks[0]) # Total kpts
+        my_kpts_idx = pw_helper.get_kpts_indices(nkpts)
+        
         for s in range(nspin):
-            dC_ks = [np.empty_like(C_k) for C_k in C_ks[s]]
             rhovec_R[s, 4] = 0
             const = 1j * np.sqrt(0.5)
-            for v in range(3):
-                for k, C_k in enumerate(C_ks[s]):
-                    if mf.with_jk.basis_ks is None:
-                        ikgv = const * (mf.kpts[k][v] + Gv[:, v])
-                    else:
-                        ikgv = const * mf.with_jk.basis_ks[k].Gk[:, v]
-                    dC_ks[k][:] = ikgv * C_k
-                rhovec_R[s, 4] += mf.with_jk.get_rho_R(
-                    dC_ks, mocc_ks[s], mesh=mesh, Gv=Gv
-                )
+            
+            tau_R_loc = 0.
+            
+            for i, k in enumerate(my_kpts_idx):
+                C_k = C_ks[s][i]
+                if mf.with_jk.basis_ks is None:
+                    ikgv = const * (mf.kpts[k][v] + Gv[:, v])
+                else:
+                    ikgv = const * mf.with_jk.basis_ks[k].Gk[:, v]
+                
+                dC_ks_loc = [np.empty_like(C_k) for C_k in C_ks[s]]
+                for v in range(3):
+                    for i_loc, k_glob in enumerate(my_kpts_idx):
+                         C_k = C_ks[s][i_loc]
+                         if mf.with_jk.basis_ks is None:
+                             ikgv = const * (mf.kpts[k_glob][v] + Gv[:, v])
+                         else:
+                             ikgv = const * mf.with_jk.basis_ks[k_glob].Gk[:, v]
+                         dC_ks_loc[i_loc][:] = ikgv * C_k
+                    
+                    rhovec_R[s, 4] += mf.with_jk.get_rho_R(
+                        dC_ks_loc, mocc_ks[s], mesh=mesh, Gv=Gv
+                    )
+
     if spin == 0:
         rhovec_R = rhovec_R[0]
     return rhovec_R
@@ -365,12 +386,14 @@ class PWKohnShamDFT(rks.KohnShamDFT):
             # non-spin-polarized
             spinfac = 1
             rho_R = rhovec_R[0]
-            nkpts = len(C_ks)
+            # KPAR: Use global nkpts (from mocc_ks which is replicated) not local len(C_ks)
+            nkpts = len(mocc_ks)
         else:
             # spin-polarized
             spinfac = 1
             rho_R = rhovec_R[:, 0].sum(0)
-            nkpts = len(C_ks[0])
+            # KPAR: Use global nkpts
+            nkpts = len(mocc_ks[0])
         if self.kpts_obj is not None:
             nkpts = self.kpts_obj.nkpts
         vj_R = self.with_jk.get_vj_R_from_rho_R(rho_R, mesh=mesh, Gv=Gv)
